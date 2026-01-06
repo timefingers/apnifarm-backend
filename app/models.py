@@ -25,11 +25,12 @@ class Animal(Base):
     farm_id = Column(Integer, ForeignKey('users.id'))
     tag_id = Column(String(50), nullable=False) # Local Visual Tag
     sra_id = Column(String(50), unique=True, nullable=False) # Global Asset ID
-    species = Column(String(20)) # 'Buffalo', 'Cow'
+    species = Column(String(20)) # 'Buffalo', 'Cow', 'Goat', 'Horse', 'Camel'
     breed = Column(String(50))
     dob = Column(Date)
     origin = Column(String(20)) # 'Home_Bred', 'Purchased'
-    status = Column(String(20)) # 'Milking', 'Dry', 'Heifer'
+    status = Column(String(20)) # 'Milking', 'Dry', 'Heifer', 'Male'
+    purchase_price = Column(Float, nullable=True) # Price if Purchased
     milk_entries = relationship("MilkEntry", back_populates="animal")
 
 class MilkEntry(Base):

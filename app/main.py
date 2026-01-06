@@ -107,13 +107,70 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 # --- Animals ---
+import string
+import random
+from datetime import datetime as dt
+
+def generate_sra_id(species: str) -> str:
+    """Generate unique SRA ID: PK-{SPECIES_CODE}-{YEAR}-{RANDOM_4}"""
+    species_codes = {
+        "Buffalo": "BUF",
+        "Cow": "COW",
+        "Goat": "GOA",
+        "Horse": "HOR",
+        "Camel": "CAM",
+    }
+    code = species_codes.get(species, "ANI")
+    year = dt.now().year
+    random_chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"PK-{code}-{year}-{random_chars}"
+
 @app.post("/animals/", response_model=schemas.Animal)
 async def create_animal(
     animal: schemas.AnimalCreate,
     user: models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    new_animal = models.Animal(**animal.dict(), farm_id=user.id)
+    # Check if tag_id already exists for this farm
+    stmt = select(models.Animal).filter(
+        models.Animal.farm_id == user.id,
+        models.Animal.tag_id == animal.tag_id
+    )
+    result = await db.execute(stmt)
+    if result.scalars().first():
+        raise HTTPException(
+            status_code=400, 
+            detail="Tag ID already exists for this farm"
+        )
+    
+    # Generate unique SRA ID
+    sra_id = generate_sra_id(animal.species.value)
+    
+    # Ensure SRA ID is unique (retry if collision)
+    for _ in range(5):
+        check_stmt = select(models.Animal).filter(models.Animal.sra_id == sra_id)
+        check_result = await db.execute(check_stmt)
+        if not check_result.scalars().first():
+            break
+        sra_id = generate_sra_id(animal.species.value)
+    
+    # Determine initial status based on species
+    # For milking animals (Buffalo, Cow, Goat, Camel) - default to Heifer
+    # For non-milking (Horse) - default to Male
+    milking_species = ["Buffalo", "Cow", "Goat", "Camel"]
+    initial_status = "Heifer" if animal.species.value in milking_species else "Male"
+    
+    new_animal = models.Animal(
+        farm_id=user.id,
+        tag_id=animal.tag_id,
+        sra_id=sra_id,
+        species=animal.species.value,
+        breed=animal.breed,
+        dob=animal.dob,
+        origin=animal.origin.value,
+        status=initial_status,
+        purchase_price=animal.purchase_price if animal.origin.value == "Purchased" else None
+    )
     db.add(new_animal)
     try:
         await db.commit()

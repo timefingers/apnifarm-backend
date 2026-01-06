@@ -1,8 +1,29 @@
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import date, datetime
+from enum import Enum
 
-# Subscription Plan
+# ==================== ENUMS ====================
+
+class SpeciesEnum(str, Enum):
+    Buffalo = "Buffalo"
+    Cow = "Cow"
+    Goat = "Goat"
+    Horse = "Horse"
+    Camel = "Camel"
+
+class OriginEnum(str, Enum):
+    Home_Bred = "Home_Bred"
+    Purchased = "Purchased"
+
+class AnimalStatusEnum(str, Enum):
+    Milking = "Milking"
+    Dry = "Dry"
+    Heifer = "Heifer"
+    Male = "Male"
+
+# ==================== SUBSCRIPTION PLAN ====================
+
 class SubscriptionPlanBase(BaseModel):
     name: str
     price_pkr: float
@@ -14,7 +35,8 @@ class SubscriptionPlan(SubscriptionPlanBase):
     class Config:
         from_attributes = True
 
-# User
+# ==================== USER ====================
+
 class UserCreate(BaseModel):
     phone_number: str
 
@@ -33,26 +55,35 @@ class User(BaseModel):
     class Config:
         from_attributes = True
 
-# Animal
-class AnimalBase(BaseModel):
+# ==================== ANIMAL ====================
+
+class AnimalCreate(BaseModel):
+    """Schema for creating a new animal - sra_id is auto-generated"""
     tag_id: str
-    sra_id: str
-    species: Optional[str] = None
-    breed: Optional[str] = None
-    dob: Optional[date] = None
-    origin: Optional[str] = None # 'Home_Bred', 'Purchased'
-    status: Optional[str] = None # 'Milking', 'Dry', 'Heifer'
+    species: SpeciesEnum
+    breed: str
+    dob: date
+    origin: OriginEnum
+    purchase_price: Optional[float] = None  # Only for Purchased origin
 
-class AnimalCreate(AnimalBase):
-    pass
-
-class AnimalUpdate(AnimalBase):
+class AnimalUpdate(BaseModel):
     tag_id: Optional[str] = None
-    sra_id: Optional[str] = None
+    breed: Optional[str] = None
+    status: Optional[AnimalStatusEnum] = None
+    purchase_price: Optional[float] = None
 
-class Animal(AnimalBase):
+class Animal(BaseModel):
+    """Full animal response schema"""
     id: int
     farm_id: Optional[int]
+    tag_id: str
+    sra_id: str
+    species: str
+    breed: Optional[str]
+    dob: Optional[date]
+    origin: Optional[str]
+    status: Optional[str]
+    purchase_price: Optional[float]
 
     class Config:
         from_attributes = True
