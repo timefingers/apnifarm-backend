@@ -63,4 +63,7 @@ class MilkEntry(Base):
     liters = Column(Float, nullable=False)
     date = Column(Date, default=datetime.utcnow)
     session = Column(String(10))
+    recorded_at = Column(DateTime, default=datetime.utcnow)
+    fat_percentage = Column(Float, nullable=True)
+    quality = Column(String(20), nullable=True)
     animal = relationship("Animal", back_populates="milk_entries")

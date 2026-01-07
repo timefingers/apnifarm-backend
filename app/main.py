@@ -1,7 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List
+from sqlalchemy import text, func, cast, Date, extract, distinct
+from typing import List, Optional
+from datetime import datetime, timedelta, date
 from . import models, schemas, database, auth
 from .database import engine
 
@@ -10,7 +12,12 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="ApniFarm API", version="2.0.0")
 
 # CORS Configuration
-origins = ["*"]  # Allow all origins for development
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000"
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -27,6 +34,15 @@ async def startup():
     # In production, use migrations (Alembic). For this setup, auto-create.
     async with engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
+        
+        # Manual Migration for MilkEntry updates
+        try:
+            # Check/Add recorded_at
+            await conn.execute(text("ALTER TABLE milk_entries ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMP WITHOUT TIME ZONE DEFAULT NOW()"))
+            await conn.execute(text("ALTER TABLE milk_entries ADD COLUMN IF NOT EXISTS fat_percentage FLOAT DEFAULT NULL"))
+            await conn.execute(text("ALTER TABLE milk_entries ADD COLUMN IF NOT EXISTS quality VARCHAR(20) DEFAULT NULL"))
+        except Exception as e:
+            print(f"Migration warning (can be ignored if columns exist): {e}")
 
 @app.get("/health")
 def health_check():
@@ -356,7 +372,7 @@ async def search_animals(
     result = await db.execute(stmt)
     animals = result.scalars().all()
     
-    return [{"id": a.id, "tag_id": a.tag_id, "sra_id": a.sra_id, "species": a.species, "breed": a.breed, "gender": a.gender} for a in animals]
+    return [{"id": a.id, "tag_id": a.tag_id, "sra_id": a.sra_id, "species": a.species, "breed": a.breed, "gender": a.gender, "status": a.status} for a in animals]
 
 @app.get("/herd/validate-sra")
 async def validate_sra_id(
@@ -383,6 +399,7 @@ async def validate_sra_id(
 
 
 # --- Milk Entries ---
+
 @app.post("/milk/", response_model=schemas.MilkEntry)
 async def add_milk_entry(
     entry: schemas.MilkEntryCreate,
@@ -396,25 +413,245 @@ async def add_milk_entry(
     if not animal:
         raise HTTPException(status_code=404, detail="Animal not found")
 
-    new_entry = models.MilkEntry(**entry.dict())
+    entry_data = entry.dict()
+    # Ensure 'date' is populated from 'recorded_at' (for backward compat or query simplicity)
+    if entry_data.get('recorded_at') and not entry_data.get('date'):
+        if isinstance(entry_data['recorded_at'], str):
+             # Should be datetime object if Pydantic parsed it, but just safely:
+             dt = datetime.fromisoformat(entry_data['recorded_at'].replace('Z', '+00:00'))
+             entry_data['date'] = dt.date()
+        else:
+             entry_data['date'] = entry_data['recorded_at'].date()
+
+    new_entry = models.MilkEntry(**entry_data)
     db.add(new_entry)
     await db.commit()
     await db.refresh(new_entry)
     return new_entry
 
-@app.get("/milk/{animal_id}", response_model=List[schemas.MilkEntry])
-async def get_milk_history(
-    animal_id: int,
+@app.get("/milk/", response_model=List[schemas.MilkEntryResponse])
+async def get_milk_entries(
+    date_filter: str = None, # 'today', 'yesterday'
+    start_date: date = None,
+    end_date: date = None,
+    animal_id: int = None,
+    session: str = None,
     user: models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-     # Verify animal belongs to user
-    stmt = select(models.Animal).filter(models.Animal.id == animal_id, models.Animal.farm_id == user.id)
-    result = await db.execute(stmt)
-    animal = result.scalars().first()
-    if not animal:
-        raise HTTPException(status_code=404, detail="Animal not found")
+    """List milk entries with filters and animal details"""
+    # Join with Animal to get tag details and filter by farm
+    stmt = select(models.MilkEntry, models.Animal).join(models.Animal).filter(models.Animal.farm_id == user.id)
+    
+    if date_filter:
+        today = datetime.utcnow().date()
+        if date_filter == 'today':
+            stmt = stmt.filter(models.MilkEntry.date == today)
+        elif date_filter == 'yesterday':
+            stmt = stmt.filter(models.MilkEntry.date == (today - timedelta(days=1)))
+            
+    if start_date and end_date:
+        stmt = stmt.filter(models.MilkEntry.date >= start_date, models.MilkEntry.date <= end_date)
         
-    stmt = select(models.MilkEntry).filter(models.MilkEntry.animal_id == animal_id)
+    if animal_id:
+        stmt = stmt.filter(models.MilkEntry.animal_id == animal_id)
+
+    if session:
+        stmt = stmt.filter(models.MilkEntry.session == session)
+        
+    stmt = stmt.order_by(models.MilkEntry.recorded_at.desc())
+    result = await db.execute(stmt)
+    rows = result.all()
+    
+    # Construct response with animal details
+    response = []
+    for entry, animal in rows:
+        # Pydantic model construction from ORM object
+        entry_dict = {c.name: getattr(entry, c.name) for c in models.MilkEntry.__table__.columns}
+        entry_dict['animal_tag_id'] = animal.tag_id
+        entry_dict['animal_species'] = animal.species
+        response.append(entry_dict)
+        
+    return response
+
+@app.put("/milk/{entry_id}", response_model=schemas.MilkEntry)
+async def update_milk_entry(
+    entry_id: int,
+    entry_update: schemas.MilkEntryCreate, # Re-using create schema for update
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Fetch existing entry joined with Animal to verify ownership
+    stmt = select(models.MilkEntry).join(models.Animal).filter(
+        models.MilkEntry.id == entry_id,
+        models.Animal.farm_id == user.id
+    )
+    result = await db.execute(stmt)
+    existing_entry = result.scalars().first()
+    
+    if not existing_entry:
+        raise HTTPException(status_code=404, detail="Milk entry not found")
+        
+    # Verify new animal belongs to user (if animal_id changed)
+    if entry_update.animal_id != existing_entry.animal_id:
+        stmt_animal = select(models.Animal).filter(models.Animal.id == entry_update.animal_id, models.Animal.farm_id == user.id)
+        res_animal = await db.execute(stmt_animal)
+        if not res_animal.scalars().first():
+             raise HTTPException(status_code=404, detail="New animal not found")
+
+    # Update fields
+    entry_data = entry_update.dict()
+    # Date logic same as create
+    if entry_data.get('recorded_at'):
+        if isinstance(entry_data['recorded_at'], str):
+             dt = datetime.fromisoformat(entry_data['recorded_at'].replace('Z', '+00:00'))
+             entry_data['date'] = dt.date()
+        else:
+             entry_data['date'] = entry_data['recorded_at'].date()
+             
+    for key, value in entry_data.items():
+        setattr(existing_entry, key, value)
+        
+    await db.commit()
+    await db.refresh(existing_entry)
+    return existing_entry
+
+@app.delete("/milk/{entry_id}")
+async def delete_milk_entry(
+    entry_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Verify ownership via join
+    stmt = select(models.MilkEntry).join(models.Animal).filter(
+        models.MilkEntry.id == entry_id,
+        models.Animal.farm_id == user.id
+    )
+    result = await db.execute(stmt)
+    entry = result.scalars().first()
+    
+    if not entry:
+        raise HTTPException(status_code=404, detail="Milk entry not found")
+        
+    await db.delete(entry)
+    await db.commit()
+    return {"message": "Entry deleted"}
+
+@app.get("/milk/stats", response_model=schemas.MilkStatsResponse)
+async def get_milk_stats(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    species: Optional[str] = None,
+    breed: Optional[str] = None,
+    status: Optional[str] = None,
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get aggregated stats for dashboard with advanced filters"""
+    
+    # Base Filters
+    filters = []
+    filters.append(models.Animal.farm_id == user.id)
+    
+    if start_date:
+        filters.append(models.MilkEntry.date >= start_date)
+    if end_date:
+        filters.append(models.MilkEntry.date <= end_date)
+    else:
+        # Default to last 7 days if NO date range provided? 
+        # Actually client should probably provide range, but let's default if both missing.
+        if not start_date:
+           today = datetime.utcnow().date()
+           filters.append(models.MilkEntry.date >= today - timedelta(days=6))
+
+    if species:
+        filters.append(models.Animal.species == species)
+    if breed:
+        filters.append(models.Animal.breed == breed)
+    if status:
+        filters.append(models.Animal.status == status)
+
+    # Helper to build query
+    def build_query(select_stmt):
+        q = select_stmt.select_from(models.MilkEntry).join(models.Animal)
+        for f in filters:
+            q = q.filter(f)
+        return q
+
+    # 1. Aggregates: Total Liters & Average/Animal
+    # We need total liters
+    stmt_sum = build_query(select(func.sum(models.MilkEntry.liters)))
+    result_sum = await db.execute(stmt_sum)
+    total_liters = result_sum.scalar() or 0.0
+
+    # Count distinct animals in this period
+    stmt_count = build_query(select(func.count(distinct(models.MilkEntry.animal_id))))
+    result_count = await db.execute(stmt_count)
+    animal_count = result_count.scalar() or 0
+    
+    avg_per_animal = (total_liters / animal_count) if animal_count > 0 else 0.0
+
+    # 2. Daily Production (Line Chart)
+    stmt_daily = build_query(select(models.MilkEntry.date, func.sum(models.MilkEntry.liters)))
+    stmt_daily = stmt_daily.group_by(models.MilkEntry.date).order_by(models.MilkEntry.date)
+    result_daily = await db.execute(stmt_daily)
+    daily_production = [{"date": r[0], "liters": r[1] or 0.0} for r in result_daily.all()]
+
+    # 3. Aggregations (Pie Chart Data)
+    species_breakdown = []
+    breed_breakdown = []
+
+    # If NO Species selected, show Species Breakdown
+    if not species:
+        stmt_species = build_query(select(models.Animal.species, func.sum(models.MilkEntry.liters), func.count(distinct(models.MilkEntry.animal_id))))
+        stmt_species = stmt_species.group_by(models.Animal.species)
+        result_species = await db.execute(stmt_species)
+        species_breakdown = [
+            {"label": r[0] or "Unknown", "total_liters": r[1] or 0.0, "avg_liters": (r[1]/r[2]) if r[2]>0 else 0} 
+            for r in result_species.all()
+        ]
+    
+    # If Species IS selected, show Breed Breakdown
+    # (Or we can always calculate it? But usually requested behavior implies context switch)
+    # The user request "When Filtered for a Species, show a breakdown... by Breed" hints conditional.
+    # However, for API flexiblity, maybe providing both is fine if cheap. But cleaner to follow logic.
+    if species:
+        stmt_breed = build_query(select(models.Animal.breed, func.sum(models.MilkEntry.liters), func.count(distinct(models.MilkEntry.animal_id))))
+        stmt_breed = stmt_breed.group_by(models.Animal.breed)
+        result_breed = await db.execute(stmt_breed)
+        breed_breakdown = [
+            {"label": r[0] or "Unknown", "total_liters": r[1] or 0.0, "avg_liters": (r[1]/r[2]) if r[2]>0 else 0}
+            for r in result_breed.all()
+        ]
+
+    # 4. Top 5 Producers (Leaderboard)
+    stmt_top = build_query(select(models.Animal.tag_id, func.sum(models.MilkEntry.liters)))
+    stmt_top = stmt_top.group_by(models.Animal.tag_id).order_by(func.sum(models.MilkEntry.liters).desc()).limit(5)
+    result_top = await db.execute(stmt_top)
+    top_producers = [{"tag_id": r[0], "total_liters": r[1] or 0.0} for r in result_top.all()]
+    
+    return schemas.MilkStatsResponse(
+        total_liters=total_liters,
+        avg_per_animal=avg_per_animal,
+        daily_production=daily_production,
+        species_breakdown=species_breakdown,
+        breed_breakdown=breed_breakdown,
+        top_producers=top_producers
+    )
+
+@app.get("/animals/milking", response_model=List[schemas.Animal])
+async def get_milking_animals(
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get animals eligible for milking (Females)"""
+    # Return all females for now. 
+    # Logic: Gender=Female AND Status NOT IN ('Sold', 'Deceased', 'Calf'?)
+    # Broad is better.
+    stmt = select(models.Animal).filter(
+        models.Animal.farm_id == user.id,
+        models.Animal.gender == schemas.GenderEnum.Female
+    ).filter(models.Animal.status.not_in(['Sold', 'Deceased']))
+    
     result = await db.execute(stmt)
     return result.scalars().all()

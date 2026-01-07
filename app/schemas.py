@@ -136,10 +136,36 @@ class WeightLog(BaseModel):
 
 # ==================== MILK ENTRY ====================
 
+import datetime as dt
+
 class MilkEntryBase(BaseModel):
     liters: float
-    date: Optional[date] = None
+    date: Optional[dt.date] = None
     session: Optional[str] = None
+    recorded_at: Optional[datetime] = None
+    fat_percentage: Optional[float] = None
+    quality: Optional[str] = None
+
+class DailyProduction(BaseModel):
+    date: date
+    liters: float
+
+class StatBreakdown(BaseModel):
+    label: str
+    total_liters: float
+    avg_liters: float
+
+class TopProducer(BaseModel):
+    tag_id: str
+    total_liters: float
+
+class MilkStatsResponse(BaseModel):
+    total_liters: float
+    avg_per_animal: float
+    daily_production: List[DailyProduction]
+    species_breakdown: List[StatBreakdown] = []
+    breed_breakdown: List[StatBreakdown] = []
+    top_producers: List[TopProducer] = []
 
 class MilkEntryCreate(MilkEntryBase):
     animal_id: int
@@ -150,3 +176,7 @@ class MilkEntry(MilkEntryBase):
 
     class Config:
         from_attributes = True
+
+class MilkEntryResponse(MilkEntry):
+    animal_tag_id: str
+    animal_species: str
