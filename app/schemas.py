@@ -82,6 +82,9 @@ class AnimalCreate(BaseModel):
     
     # Biometrics (optional)
     weight_kg: Optional[float] = None   # Initial weight - creates WeightLog entry
+    
+    # Status (optional, overrides auto-logic)
+    status: Optional[str] = None
 
 class AnimalUpdate(BaseModel):
     tag_id: Optional[str] = None

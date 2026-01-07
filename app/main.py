@@ -125,7 +125,7 @@ def generate_sra_id(species: str) -> str:
     random_chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"PK-{code}-{year}-{random_chars}"
 
-@app.post("/animals/", response_model=schemas.Animal)
+@app.post("/herd/", response_model=schemas.Animal)
 async def create_animal(
     animal: schemas.AnimalCreate,
     user: models.User = Depends(auth.get_current_user),
@@ -170,9 +170,11 @@ async def create_animal(
             break
         sra_id = generate_sra_id(animal.species.value)
     
-    # Determine initial status based on gender and species
-    if animal.gender.value == "Male":
-        initial_status = "Bull"
+    # Determine initial status
+    if animal.status:
+        initial_status = animal.status
+    elif animal.gender.value == "Male":
+        initial_status = "Calf" # Default for male if unlocked status not provided
     else:
         # Female: default to Heifer (young female) or Calf based on age
         initial_status = "Heifer"
@@ -217,7 +219,7 @@ async def create_animal(
         await db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/animals/", response_model=List[schemas.Animal])
+@app.get("/herd/", response_model=List[schemas.Animal])
 async def get_animals(
     user: models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -226,7 +228,95 @@ async def get_animals(
     result = await db.execute(stmt)
     return result.scalars().all()
 
-@app.get("/animals/next-tag")
+@app.delete("/herd/{animal_id}")
+async def delete_animal(
+    animal_id: int,
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Check ownership
+    stmt = select(models.Animal).filter(
+        models.Animal.id == animal_id,
+        models.Animal.farm_id == user.id
+    )
+    result = await db.execute(stmt)
+    animal = result.scalar_one_or_none()
+    
+    if not animal:
+        raise HTTPException(status_code=404, detail="Animal not found")
+    
+    # Clear any offspring references (set dam_id to NULL for animals that have this as parent)
+    from sqlalchemy import update, delete
+    
+    # 1. Clear parent references in other animals
+    await db.execute(
+        update(models.Animal)
+        .where(models.Animal.dam_id == animal_id)
+        .values(dam_id=None, dam_label=f"Deleted #{animal.tag_id}")
+    )
+    
+    # 2. Delete related WeightLogs
+    await db.execute(
+        delete(models.WeightLog).where(models.WeightLog.animal_id == animal_id)
+    )
+    
+    # 3. Delete related MilkEntries
+    await db.execute(
+        delete(models.MilkEntry).where(models.MilkEntry.animal_id == animal_id)
+    )
+    
+    await db.delete(animal)
+    await db.commit()
+    return {"message": "Animal deleted successfully"}
+
+@app.put("/herd/{animal_id}", response_model=schemas.Animal)
+async def update_animal(
+    animal_id: int,
+    animal_update: dict,
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Check ownership
+    stmt = select(models.Animal).filter(
+        models.Animal.id == animal_id,
+        models.Animal.farm_id == user.id
+    )
+    result = await db.execute(stmt)
+    animal = result.scalar_one_or_none()
+    
+    if not animal:
+        raise HTTPException(status_code=404, detail="Animal not found")
+    
+    # Update fields from dict (partial update)
+    if 'tag_id' in animal_update:
+        animal.tag_id = animal_update['tag_id']
+    if 'species' in animal_update:
+        animal.species = animal_update['species']
+    if 'breed' in animal_update:
+        animal.breed = animal_update['breed']
+    if 'gender' in animal_update:
+        animal.gender = animal_update['gender']
+    if 'dob' in animal_update:
+        from datetime import datetime
+        if isinstance(animal_update['dob'], str):
+            animal.dob = datetime.strptime(animal_update['dob'], '%Y-%m-%d').date()
+        else:
+            animal.dob = animal_update['dob']
+    if 'origin' in animal_update:
+        animal.origin = animal_update['origin']
+    if 'status' in animal_update:
+        animal.status = animal_update['status']
+    if 'purchase_price' in animal_update:
+        animal.purchase_price = animal_update['purchase_price']
+    if 'initial_weight' in animal_update:
+        animal.initial_weight = animal_update['initial_weight']
+    
+    await db.commit()
+    await db.refresh(animal)
+    return animal
+
+
+@app.get("/herd/next-tag")
 async def get_next_tag_id(
     user: models.User = Depends(auth.get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -244,7 +334,7 @@ async def get_next_tag_id(
     next_tag = (max_tag or 0) + 1
     return {"next_tag_id": str(next_tag)}
 
-@app.get("/animals/search")
+@app.get("/herd/search")
 async def search_animals(
     q: str = "",
     gender: str = None,
@@ -268,7 +358,7 @@ async def search_animals(
     
     return [{"id": a.id, "tag_id": a.tag_id, "sra_id": a.sra_id, "species": a.species, "breed": a.breed, "gender": a.gender} for a in animals]
 
-@app.get("/animals/validate-sra")
+@app.get("/herd/validate-sra")
 async def validate_sra_id(
     sra_id: str,
     gender: str,
