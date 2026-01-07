@@ -143,6 +143,22 @@ async def create_animal(
             detail="Tag ID already exists for this farm"
         )
     
+    # Resolve dam_tag_id to dam_id if provided
+    dam_id = None
+    if animal.dam_tag_id:
+        dam_stmt = select(models.Animal).filter(
+            models.Animal.farm_id == user.id,
+            models.Animal.tag_id == animal.dam_tag_id
+        )
+        dam_result = await db.execute(dam_stmt)
+        dam_animal = dam_result.scalars().first()
+        if not dam_animal:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Mother Tag '{animal.dam_tag_id}' not found in your farm"
+            )
+        dam_id = dam_animal.id
+    
     # Generate unique SRA ID
     sra_id = generate_sra_id(animal.species.value)
     
@@ -154,11 +170,12 @@ async def create_animal(
             break
         sra_id = generate_sra_id(animal.species.value)
     
-    # Determine initial status based on species
-    # For milking animals (Buffalo, Cow, Goat, Camel) - default to Heifer
-    # For non-milking (Horse) - default to Male
-    milking_species = ["Buffalo", "Cow", "Goat", "Camel"]
-    initial_status = "Heifer" if animal.species.value in milking_species else "Male"
+    # Determine initial status based on gender and species
+    if animal.gender.value == "Male":
+        initial_status = "Bull"
+    else:
+        # Female: default to Heifer (young female) or Calf based on age
+        initial_status = "Heifer"
     
     new_animal = models.Animal(
         farm_id=user.id,
@@ -166,15 +183,35 @@ async def create_animal(
         sra_id=sra_id,
         species=animal.species.value,
         breed=animal.breed,
+        gender=animal.gender.value,
         dob=animal.dob,
         origin=animal.origin.value,
         status=initial_status,
-        purchase_price=animal.purchase_price if animal.origin.value == "Purchased" else None
+        purchase_price=animal.purchase_price if animal.origin.value == "Purchased" else None,
+        # Genealogy
+        dam_id=dam_id,
+        dam_label=animal.dam_label,
+        sire_label=animal.sire_label,
+        # Biometrics
+        initial_weight=animal.weight_kg
     )
     db.add(new_animal)
+    
     try:
         await db.commit()
         await db.refresh(new_animal)
+        
+        # Create WeightLog entry if weight provided
+        if animal.weight_kg:
+            weight_log = models.WeightLog(
+                animal_id=new_animal.id,
+                weight_kg=animal.weight_kg,
+                date=dt.now().date(),
+                notes="Initial Weight"
+            )
+            db.add(weight_log)
+            await db.commit()
+        
         return new_animal
     except Exception as e:
         await db.rollback()
@@ -188,6 +225,72 @@ async def get_animals(
     stmt = select(models.Animal).filter(models.Animal.farm_id == user.id)
     result = await db.execute(stmt)
     return result.scalars().all()
+
+@app.get("/animals/next-tag")
+async def get_next_tag_id(
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get suggested next tag ID (max existing + 1)"""
+    from sqlalchemy import func, cast, Integer
+    
+    # Get max numeric tag_id for this farm
+    stmt = select(func.max(cast(models.Animal.tag_id, Integer))).filter(
+        models.Animal.farm_id == user.id
+    )
+    result = await db.execute(stmt)
+    max_tag = result.scalar()
+    
+    next_tag = (max_tag or 0) + 1
+    return {"next_tag_id": str(next_tag)}
+
+@app.get("/animals/search")
+async def search_animals(
+    q: str = "",
+    gender: str = None,
+    species: str = None,
+    user: models.User = Depends(auth.get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Search animals by tag_id, filtered by gender and species"""
+    stmt = select(models.Animal).filter(models.Animal.farm_id == user.id)
+    
+    if q:
+        stmt = stmt.filter(models.Animal.tag_id.ilike(f"%{q}%"))
+    if gender:
+        stmt = stmt.filter(models.Animal.gender == gender)
+    if species:
+        stmt = stmt.filter(models.Animal.species == species)
+    
+    stmt = stmt.limit(10)
+    result = await db.execute(stmt)
+    animals = result.scalars().all()
+    
+    return [{"id": a.id, "tag_id": a.tag_id, "sra_id": a.sra_id, "species": a.species, "breed": a.breed, "gender": a.gender} for a in animals]
+
+@app.get("/animals/validate-sra")
+async def validate_sra_id(
+    sra_id: str,
+    gender: str,
+    species: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Validate external SRA ID for lineage - checks gender and species match"""
+    stmt = select(models.Animal).filter(models.Animal.sra_id == sra_id)
+    result = await db.execute(stmt)
+    animal = result.scalars().first()
+    
+    if not animal:
+        return {"valid": False, "error": "SRA ID not found"}
+    
+    if animal.gender != gender:
+        return {"valid": False, "error": f"Gender mismatch: expected {gender}, found {animal.gender}"}
+    
+    if animal.species != species:
+        return {"valid": False, "error": f"Species mismatch: expected {species}, found {animal.species}"}
+    
+    return {"valid": True, "animal": {"tag_id": animal.tag_id, "breed": animal.breed}}
+
 
 # --- Milk Entries ---
 @app.post("/milk/", response_model=schemas.MilkEntry)

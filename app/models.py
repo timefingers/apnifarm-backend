@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Date
-from sqlalchemy.orm import relationship, Mapped, mapped_column
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Date, Text
+from sqlalchemy.orm import relationship
 from datetime import datetime
 from .database import Base
 
@@ -27,11 +27,34 @@ class Animal(Base):
     sra_id = Column(String(50), unique=True, nullable=False) # Global Asset ID
     species = Column(String(20)) # 'Buffalo', 'Cow', 'Goat', 'Horse', 'Camel'
     breed = Column(String(50))
+    gender = Column(String(10)) # 'Male', 'Female'
     dob = Column(Date)
     origin = Column(String(20)) # 'Home_Bred', 'Purchased'
     status = Column(String(20)) # 'Milking', 'Dry', 'Heifer', 'Male'
     purchase_price = Column(Float, nullable=True) # Price if Purchased
+    
+    # Genealogy
+    dam_id = Column(Integer, ForeignKey('animals.id'), nullable=True) # Internal mother
+    dam_label = Column(String(100), nullable=True) # External mother name/tag
+    sire_label = Column(String(100), nullable=True) # Father name/code
+    
+    # Biometrics
+    initial_weight = Column(Float, nullable=True) # First recorded weight in kg
+    
+    # Relationships
+    dam = relationship("Animal", remote_side=[id], foreign_keys=[dam_id])
     milk_entries = relationship("MilkEntry", back_populates="animal")
+    weight_logs = relationship("WeightLog", back_populates="animal")
+
+class WeightLog(Base):
+    __tablename__ = 'weight_logs'
+    id = Column(Integer, primary_key=True)
+    animal_id = Column(Integer, ForeignKey('animals.id'), nullable=False)
+    weight_kg = Column(Float, nullable=False)
+    date = Column(Date, default=datetime.utcnow)
+    notes = Column(Text, nullable=True) # e.g., "Initial Weight", "Monthly Check"
+    
+    animal = relationship("Animal", back_populates="weight_logs")
 
 class MilkEntry(Base):
     __tablename__ = 'milk_entries'
