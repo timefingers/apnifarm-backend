@@ -127,8 +127,8 @@ import string
 import random
 from datetime import datetime as dt
 
-def generate_sra_id(species: str) -> str:
-    """Generate unique SRA ID: PK-{SPECIES_CODE}-{YEAR}-{RANDOM_4}"""
+def generate_sra_id(species: str, farm_id: int) -> str:
+    """Generate unique SRA ID: PK-F{FARM_ID}-{SPECIES_CODE}-{YEAR}-{RANDOM_4}"""
     species_codes = {
         "Buffalo": "BUF",
         "Cow": "COW",
@@ -139,7 +139,7 @@ def generate_sra_id(species: str) -> str:
     code = species_codes.get(species, "ANI")
     year = dt.now().year
     random_chars = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
-    return f"PK-{code}-{year}-{random_chars}"
+    return f"PK-F{farm_id}-{code}-{year}-{random_chars}"
 
 @app.post("/herd/", response_model=schemas.Animal)
 async def create_animal(
@@ -176,7 +176,7 @@ async def create_animal(
         dam_id = dam_animal.id
     
     # Generate unique SRA ID
-    sra_id = generate_sra_id(animal.species.value)
+    sra_id = generate_sra_id(animal.species.value, user.id)
     
     # Ensure SRA ID is unique (retry if collision)
     for _ in range(5):
@@ -184,7 +184,7 @@ async def create_animal(
         check_result = await db.execute(check_stmt)
         if not check_result.scalars().first():
             break
-        sra_id = generate_sra_id(animal.species.value)
+        sra_id = generate_sra_id(animal.species.value, user.id)
     
     # Determine initial status
     if animal.status:
